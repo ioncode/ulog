@@ -1,0 +1,51 @@
+name: Run Tests
+
+# Указываем триггеры: запускать при пушах и PR в ветки main и master
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    name: Go Test Runner
+    runs-on: ubuntu-latest
+
+    strategy:
+      # Проверяем библиотеку сразу на нескольких версиях Go (матрица сборки)
+      matrix:
+        go-version: [ '1.21', '1.22', '1.23' ]
+
+    steps:
+      # 1. Скачиваем исходный код репозитория на виртуальную машину
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Устанавливаем необходимую версию Go из матрицы
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true # Включает автоматическое кэширование go.mod зависимостей
+
+      # 3. Скачиваем зависимости (в нашем случае uuid и zerolog)
+      - name: Install dependencies
+        run: go mod download
+
+      # 4. Проверяем форматирование кода (идиоматичный шаг для Go)
+      - name: Verify code formatting
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "Код не отформатирован с помощью gofmt! Пожалуйста, запустите 'gofmt -w .'"
+            gofmt -l .
+            exit 1
+          fi
+
+      # 5. Запускаем линтер go vet для поиска статических ошибок
+      - name: Run go vet
+        run: go vet ./...
+
+      # 6. Запускаем наши юнит-тесты с флагом проверки на состояние гонки (race detector)
+      - name: Run unit tests
+        run: go test -v -race -coverprofile=coverage.txt -covermode=atomic ./...
