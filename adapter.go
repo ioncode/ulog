@@ -34,6 +34,10 @@ func (a *ZerologAdapter) Debug() LoggerEvent {
 	return &zerologEventAdapter{event: a.ZLog.Debug()}
 }
 
+func (a *ZerologAdapter) Warn() LoggerEvent {
+	return &zerologEventAdapter{event: a.ZLog.Warn()}
+}
+
 type zerologEventAdapter struct {
 	event *zerolog.Event
 }
