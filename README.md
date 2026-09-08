@@ -1,4 +1,4 @@
-# ulog 🪵
+# ulog 🚀
 
 [![Go Reference](https://go.dev)](https://go.dev)
 [![Go Report Card](https://goreportcard.com)](https://goreportcard.com)
