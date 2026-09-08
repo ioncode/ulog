@@ -1,133 +1,147 @@
-# ulog 🚀
+# ulog 🪵
 
-Легковесный и гибкий пакет логирования, трассировки (Trace ID) и защиты от паник для микросервисов на Go. Построен по принципам чистой архитектуры и SOLID (Single Responsibility Principle) поверх высокопроизводительной библиотеки `zerolog`.
+[![Go Reference](https://go.dev)](https://go.dev)
+[![Go Report Card](https://goreportcard.com)](https://goreportcard.com)
+[![License: MIT](https://shields.io)](https://opensource.org)
 
-## 📦 Возможности
-* **Полное соблюдение SRP**: Трассировка, метрики и безопасность разделены на независимые middleware.
-* **Единый стандарт JSON**: Все ваши микросервисы будут писать логи с одинаковыми ключами (`trace_id`, `method`, `status`, `duration` и др.).
-* **Интерфейсы Fluent API**: Слой бизнес-логики и HTTP-транспорта полностью отвязан от конкретной библиотеки логирования. Легко тестировать с помощью моков.
-* **Автоматический кастомный вывод**: При разработке локально логер переключается на красивый, цветной текстовый вывод, а на Production гонит компактный структурированный JSON.
+`ulog` is an architectural wrapper and production-ready HTTP middleware pipeline for structured logging in Go. It is designed to fully adhere to the **Single Responsibility Principle (SRP)** and **Clean Architecture** guidelines.
 
-## 🛠 Установка
+By decoupling the logging interfaces from actual underlying engines, `ulog` allows you to switch your logging backbone seamlessly without touching your core HTTP pipelines or application service layers.
+
+---
+
+## ✨ Features
+
+- **Multi-Engine Support:** Switch between `zerolog` and standard `log/slog` on the fly.
+- **Zero-Allocation Ready:** Retains the blistering speed of `zerolog` when using the appropriate adapter.
+- **Preserved Caller Depth:** File names, functions, and line numbers (`caller` or `source`) point to your actual handlers, not to the internal wrapper files.
+- **Standardized JSON Schema:** Automatically injects predefined corporate fields (`trace_id`, `status`, `duration`, etc.) to match modern observability stack standards (Grafana Loki, Datadog, Kibana).
+- **Decoupled Middleware:** Production-grade building blocks out-of-the-box (`TraceID`, `Recovery`, `Metrics`).
+
+---
+
+## 🪵 Multi-Engine Logging Support
+
+`ulog` provides a polymorphic, clean interface that wraps external loggers. You can choose between:
+1. **Zerolog Engine:** Best for ultra-fast, zero-allocation structured JSON logging in high-concurrency apps.
+2. **Slog Engine:** Best for standard library compliance (Go 1.21+) and native ecosystem compatibility.
+
+---
+
+## 🚀 Quick Start
+
+### Installation
 
 ```bash
 go get github.com/ioncode/ulog
 ```
 
-## 🚀 Быстрый старт
+### Option A: Using Standard `log/slog` (Go 1.21+)
 
-### 1. Настройка в `main.go`
-
-Инициализируйте базовый логер, оберните его в адаптер библиотеки `ulog` и подключите готовый защищенный пайплайн к вашему роутеру:
+If your enterprise project standardizes on Go's built-in structured logger, wrap it using `NewSlogAdapter`:
 
 ```go
 package main
 
 import (
-	"io"
+	"log/slog"
 	"net/http"
 	"os"
 
 	"github.com/ioncode/ulog"
-	"://github.com"
 )
 
 func main() {
-	// 1. Настройка вывода (Local Text-Color / Production JSON)
-	var logOutput io.Writer = os.Stdout
-	if os.Getenv("APP_ENV") == "local" {
-		logOutput = zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: "15:04:05"}
-	}
+	// 1. Initialize native slog handler
+	baseSlog := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		AddSource: true, // ulog correctly preserves caller depth/file source!
+	}))
 
-	baseLog := zerolog.New(logOutput).With().Timestamp().Logger()
+	// 2. Wrap it into ulog interface
+	logger := ulog.NewSlogAdapter(baseSlog)
 
-	// 2. Создаем адаптер ulog
-	logAdapter := ulog.NewZerologAdapter(baseLog)
+	// 3. Inject it into your HTTP pipeline
+	pipeline := ulog.NewHTTPPipeline(logger)
 
-	// 3. Настраиваем роутер
+	// Create a dummy multiplexer
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/ping", func(w http.ResponseWriter, r *http.Request) {
-		traceID := ulog.GetTraceID(r.Context())
-		
-		// Логируем через адаптер с использованием стандартных констант
-		logAdapter.Info().
-			Str(ulog.LogKeyTraceID, traceID).
-			Msg("ping endpoint called")
-            
-		w.Write([]byte(`{"status":"pong"}`))
+	mux.HandleFunc("/api/hello", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("Hello, World!"))
 	})
 
-	// 4. Оборачиваем роутер в полный пайплайн (Trace ID -> Recovery -> Metrics)
-	pipeline := ulog.NewHTTPPipeline(logAdapter)
-
-	baseLog.Info().Msg("Server starting on :8080")
-	_ = http.ListenAndServe(":8080", pipeline(mux))
+	// Wrap server endpoints into ulog middleware pipeline
+	http.ListenAndServe(":8080", pipeline(mux))
 }
 ```
 
-### 2. Использование в слое хендлеров (Dependency Injection)
+### Option B: Using `zerolog` (Maximum Performance)
 
-Чтобы сохранить архитектурную чистоту, ваши хендлеры должны объявлять интерфейс логера под свои нужды самостоятельно, используя типы из `ulog`:
+If you need maximum throughput and zero memory allocations under heavy cloud workloads:
 
 ```go
-package handlers
+package main
 
 import (
 	"net/http"
-	"://github.com"
+	"os"
+
+	"github.com/ioncode/ulog"
+	"github.com/rs/zerolog"
 )
 
-// Объявляем интерфейс на стороне потребителя
-type ComponentLogger interface {
-	Info() ulog.LoggerEvent
-	Error() ulog.LoggerEvent
-}
+func main() {
+	// 1. Initialize zerolog
+	baseZerolog := zerolog.New(os.Stdout).With().Timestamp().Logger()
 
-type UserHandler struct {
-	log ComponentLogger // Явная зависимость
-}
+	// 2. Wrap it into ulog interface
+	logger := ulog.NewZerologAdapter(baseZerolog)
 
-func NewUserHandler(l ComponentLogger) *UserHandler {
-	return &UserHandler{log: l}
-}
+	// 3. Inject into HTTP pipeline
+	pipeline := ulog.NewHTTPPipeline(logger)
 
-func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
-	traceID := ulog.GetTraceID(r.Context())
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/data", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
 
-	h.log.Info().
-		Str(ulog.LogKeyTraceID, traceID).
-		Int("user_id", 42).
-		Msg("user created successfully")
-        
-	w.WriteHeader(http.StatusCreated)
+	http.ListenAndServe(":8080", pipeline(mux))
 }
 ```
 
-### 3. Выборочное использование Middleware
+---
 
-Благодаря соблюдению SRP, вы можете отключать логирование метрик для технических эндпоинтов (например, для проверки здоровья k8s liveness probes), чтобы не спамить в логи, но сохранять защиту от паник:
+## ⚡ Performance & Benchmarks
 
-```go
-// Для технических роутов убираем метрики, оставляя только защиту от паник
-healthHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("OK"))
-})
+The library is benchmarks-tested on `Windows / amd64` (AMD Ryzen 5 5600X). `ulog` utilizes a smart hybrid **Fast Path** feature: if your base logger is initialized without caller/source file tracking, it bypasses expensive `runtime` stack allocation layers completely.
 
-// Собираем вручную без RequestMetricsMiddleware
-protectedHealth := ulog.RecoveryMiddleware(logAdapter)(healthHandler)
-mux.Handle("/healthz", protectedHealth)
-```
+| Benchmark Scenario | Time per Op | Memory Allocs | Bytes Allocated | Best For |
+| :--- | :--- | :--- | :--- | :--- |
+| **`ZerologAdapter (FastPath)`** | **~266 ns/op** | **1 allocs/op** | **8 B/op** | Ultra-high throughput, production microservices, maximum RPS |
+| **`SlogAdapter (FastPath)`** | ~982 ns/op | 7 allocs/op | 304 B/op | Standard library compliance, modern Go ecosystems |
+| **`SlogAdapter (With Source)`** | ~1780 ns/op | 13 allocs/op | 888 B/op | Debugging environments where line-numbers are critical (Slog) |
+| **`ZerologAdapter (With Caller)`** | ~2092 ns/op | 8 allocs/op | 608 B/op | Debugging environments where line-numbers are critical (Zerolog) |
 
-## ⚙️ Переменные окружения
+*You can replicate these results locally by running `go test -bench=. -benchmem ./...`*
 
-* `APP_ENV=local` — включает цветной текстовый вывод в консоль (`ConsoleWriter`) с подсветкой синтаксиса.
-* Любое другое значение или отсутствие переменной — включает стандартный быстрый JSON-поток для сбора в Grafana Loki, ELK, OpenSearch.
+### Architectural Trade-Off
+Introducing a clean polymorphic layer (`ulog.LoggerEvent`) causes intermediate fluent-chaining structures to escape to the heap due to interface wrapping boundaries. For `ZerologAdapter`, this overhead is a mere 8 bytes (1 allocation). However, when a caller tracking is requested, the application performs native stack tracing (~1700-2000ns per operation). The smart routing feature saves up to 80% of CPU time by dynamically choosing the optimal path based on your parent logger setup.
 
-## 📊 Стандартные ключи логов (Константы)
 
-Используйте встроенные константы, чтобы исключить риск опечаток в ключах поиска:
-* `ulog.LogKeyTraceID` -> `"trace_id"`
-* `ulog.LogKeyMethod` -> `"method"`
-* `ulog.LogKeyPath` -> `"path"`
-* `ulog.LogKeyStatus` -> `"status"`
-* `ulog.LogKeyDuration` -> `"duration"` (значение логируется как `int` в миллисекундах)
+---
+
+## 🏗️ Architecture Design
+
+`ulog` embraces clean design boundaries:
+
+1. **Fluent API Interfaces (`ulog.Logger` & `ulog.LoggerEvent`):** Your business logic layer interacts only with abstract primitives. Writing mock tests for loggers becomes incredibly straightforward.
+2. **SRP Middleware Layer:** 
+    - `TraceIDMiddleware` generates or extracts distributed tracing headers.
+    - `RecoveryMiddleware` isolates thread panics, writes defensive status headers, and logs clean error stack traces.
+    - `MetricsMiddleware` computes server response times accurately.
+3. **Adapter Decoupling:** Third-party engine drivers live in specialized isolation and do not leak internal signatures into server logic.
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

@@ -1,13 +1,15 @@
 package ulog
 
-// Константы для унификации ключей логирования во всех ваших микросервисах.
+// Ключи для JSON-логов, стандартизирующие схему данных в observability-стеке
 const (
 	LogKeyTraceID  = "trace_id"
+	LogKeyStatus   = "status"
+	LogKeyDuration = "duration_ms"
 	LogKeyMethod   = "method"
 	LogKeyPath     = "path"
-	LogKeyStatus   = "status"
-	LogKeySize     = "size"
-	LogKeyDuration = "duration"
-	LogKeyPanic    = "panic"
-	LogKeyStack    = "stack"
 )
+
+// Ключ для контекста Go, чтобы прокидывать Trace ID сквозь приложение
+type contextKey string
+
+const traceIDKey contextKey = "trace_id"

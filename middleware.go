@@ -1,108 +1,119 @@
 package ulog
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
 	"net/http"
 	"runtime/debug"
 	"time"
-
-	"github.com/google/uuid"
 )
 
-// pipelineLogger абстрагирует логер для middleware
-type pipelineLogger interface {
-	Info() LoggerEvent
-	Error() LoggerEvent
-}
-
-type loggingResponseWriter struct {
+// responseWriterInterceptor перехватывает HTTP-статус для логирования
+type responseWriterInterceptor struct {
 	http.ResponseWriter
-	status int
-	size   int
+	statusCode int
 }
 
-func (r *loggingResponseWriter) Write(b []byte) (int, error) {
-	if r.status == 0 {
-		r.status = http.StatusOK
+func (w *responseWriterInterceptor) WriteHeader(statusCode int) {
+	w.statusCode = statusCode
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+// NewHTTPPipeline собирает стандартную цепочку production-мидлварей.
+// Принимает абстрактный ulog.Logger, что позволяет передавать любой адаптер.
+func NewHTTPPipeline(logger Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return TraceIDMiddleware()(
+			RecoveryMiddleware(logger)(
+				MetricsMiddleware(logger)(next),
+			),
+		)
 	}
-	size, err := r.ResponseWriter.Write(b)
-	r.size += size
-	return size, err
 }
 
-func (r *loggingResponseWriter) WriteHeader(statusCode int) {
-	r.ResponseWriter.WriteHeader(statusCode)
-	r.status = statusCode
+// TraceIDMiddleware извлекает или генерирует уникальный ID запроса
+func TraceIDMiddleware() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			traceID := r.Header.Get("X-Trace-ID")
+			if traceID == "" {
+				traceID = generateRandomID()
+			}
+
+			// Устанавливаем заголовок ответа для клиента
+			w.Header().Set("X-Trace-ID", traceID)
+
+			// Пробрасываем trace_id в контекст запроса, используя ключ из constants.go
+			ctx := ContextWithTraceID(r.Context(), traceID)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
 }
 
-// TraceMiddleware отвечает за генерацию и прокидывание Trace ID.
-func TraceMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceID := r.Header.Get("X-Trace-ID")
-		if traceID == "" {
-			traceID = uuid.New().String()
-		}
-		w.Header().Set("X-Trace-ID", traceID)
+// MetricsMiddleware замеряет время выполнения запроса и логирует результат
+func MetricsMiddleware(logger Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			traceID, _ := r.Context().Value(traceIDKey).(string)
 
-		ctx := ContextWithTraceID(r.Context(), traceID)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+			// Оборачиваем ResponseWriter, чтобы узнать код ответа в конце
+			interceptor := &responseWriterInterceptor{ResponseWriter: w, statusCode: http.StatusOK}
+
+			next.ServeHTTP(interceptor, r)
+
+			duration := time.Since(start).Milliseconds()
+
+			// Логируем событие через наш чистый абстрактный интерфейс ulog.Logger
+			logger.Info().
+				Str(LogKeyTraceID, traceID).
+				Str(LogKeyMethod, r.Method).
+				Str(LogKeyPath, r.URL.Path).
+				Int(LogKeyStatus, interceptor.statusCode).
+				Int(LogKeyDuration, int(duration)).
+				Msg("HTTP request processed")
+		})
+	}
 }
 
-// RecoveryMiddleware принимает интерфейс pipelineLogger
-func RecoveryMiddleware(log pipelineLogger) func(http.Handler) http.Handler {
+// RecoveryMiddleware безопасно перехватывает паники, предотвращая падение сервера
+func RecoveryMiddleware(logger Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
-				if rec := recover(); rec != nil {
-					traceID := GetTraceID(r.Context())
+				if err := recover(); err != nil {
+					traceID, _ := r.Context().Value(traceIDKey).(string)
 
-					log.Error().
+					// Превращаем panic в человекочитаемую ошибку и получаем стек-трейс
+					panicErr := fmt.Errorf("%v", err)
+					stackTrace := string(debug.Stack())
+
+					// Логируем критическую ошибку через ulog.Logger
+					logger.Error().
 						Str(LogKeyTraceID, traceID).
-						Str(LogKeyPanic, string(debug.Stack())).
-						Msg("panic recovered in HTTP handler")
+						Str(LogKeyMethod, r.Method).
+						Str(LogKeyPath, r.URL.Path).
+						Err(panicErr).
+						Str("stack_trace", stackTrace).
+						Msg("HTTP handler panic recovered")
 
+					// Возвращаем клиенту красивый 500 статус
 					w.WriteHeader(http.StatusInternalServerError)
-					_, _ = w.Write([]byte(`{"error":"internal server error"}`))
+					_, _ = w.Write([]byte("Internal Server Error"))
 				}
 			}()
+
 			next.ServeHTTP(w, r)
 		})
 	}
 }
 
-// RequestMetricsMiddleware принимает интерфейс pipelineLogger
-func RequestMetricsMiddleware(log pipelineLogger) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			start := time.Now()
-
-			lw := &loggingResponseWriter{ResponseWriter: w, status: http.StatusOK}
-			next.ServeHTTP(lw, r)
-
-			traceID := GetTraceID(r.Context())
-
-			// Считаем длительность в миллисекундах
-			durationMs := int(time.Since(start).Milliseconds())
-
-			// ИСПРАВЛЕНО: Заменили несуществующий .Duration() на .Int()
-			log.Info().
-				Str(LogKeyTraceID, traceID).
-				Str(LogKeyMethod, r.Method).
-				Str(LogKeyPath, r.URL.Path).
-				Int(LogKeyStatus, lw.status).
-				Int(LogKeySize, lw.size).
-				Int(LogKeyDuration, durationMs). // Передаем как миллисекунды (int)
-				Msg("handled HTTP request")
-		})
+// Вспомогательная функция для генерации криптостойких ID запросов
+func generateRandomID() string {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		return "unknown-trace-id"
 	}
-}
-
-// NewHTTPPipeline объединяет все middleware
-func NewHTTPPipeline(log *ZerologAdapter) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		pipeline := RequestMetricsMiddleware(log)(next)
-		pipeline = RecoveryMiddleware(log)(pipeline)
-		pipeline = TraceMiddleware(pipeline)
-		return pipeline
-	}
+	return hex.EncodeToString(bytes)
 }
