@@ -33,7 +33,7 @@ By decoupling the logging interfaces from actual underlying engines, `ulog` allo
 ### Installation
 
 ```bash
-go get github.com/ioncode/ulog
+go get github.com/ioncode/ulog/v2
 ```
 
 ### Option A: Using Standard `log/slog` (Go 1.21+)
@@ -48,7 +48,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/ioncode/ulog"
+	"github.com/ioncode/ulog/v2"
 )
 
 func main() {
@@ -85,7 +85,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/ioncode/ulog"
+	"github.com/ioncode/ulog/v2"
 	"github.com/rs/zerolog"
 )
 
