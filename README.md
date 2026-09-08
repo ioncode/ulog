@@ -2,7 +2,7 @@
 
 [![Go Reference](https://go.dev)](https://go.dev)
 [![Go Report Card](https://goreportcard.com)](https://goreportcard.com)
-[![License: MIT](https://shields.io)](https://opensource.org)
+[![License: AGPL v3](https://shields.io)](https://gnu.org)
 
 `ulog` is an architectural wrapper and production-ready HTTP middleware pipeline for structured logging in Go. It is designed to fully adhere to the **Single Responsibility Principle (SRP)** and **Clean Architecture** guidelines.
 
@@ -33,7 +33,7 @@ By decoupling the logging interfaces from actual underlying engines, `ulog` allo
 ### Installation
 
 ```bash
-go get github.com/ioncode/ulog
+go get github.com/ioncode/ulog/v2
 ```
 
 ### Option A: Using Standard `log/slog` (Go 1.21+)
@@ -48,7 +48,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/ioncode/ulog"
+	"github.com/ioncode/ulog/v2"
 )
 
 func main() {
@@ -85,7 +85,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/ioncode/ulog"
+	"github.com/ioncode/ulog/v2"
 	"github.com/rs/zerolog"
 )
 
@@ -144,4 +144,5 @@ Introducing a clean polymorphic layer (`ulog.LoggerEvent`) causes intermediate f
 
 ## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the GNU Affero General Public License v3 - see the [LICENSE](LICENSE) file for details.
+

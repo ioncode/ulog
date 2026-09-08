@@ -1,4 +1,4 @@
-module github.com/ioncode/ulog
+module github.com/ioncode/ulog/v2
 
 go 1.26.1
 
