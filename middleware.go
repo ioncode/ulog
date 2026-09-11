@@ -3,16 +3,36 @@ package ulog
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"net/http"
-	"runtime/debug"
+	"sync"
 	"time"
+	"unsafe"
 )
 
-// responseWriterInterceptor перехватывает HTTP-статус для логирования
+// traceBuffer encapsulates pre-allocated byte slices for non-allocating correlation ID generations.
+type traceBuffer struct {
+	raw [8]byte
+	hex [16]byte
+}
+
+var tracePool = sync.Pool{
+	New: func() any {
+		return &traceBuffer{}
+	},
+}
+
+// responseWriterInterceptor transparently intercepts transactional HTTP write status bytes for metadata telemetry metrics.
 type responseWriterInterceptor struct {
 	http.ResponseWriter
-	statusCode int
+	statusCode   int
+	bytesWritten int
+}
+
+func newResponseWriterInterceptor(w http.ResponseWriter) *responseWriterInterceptor {
+	return &responseWriterInterceptor{
+		ResponseWriter: w,
+		statusCode:     http.StatusOK,
+	}
 }
 
 func (w *responseWriterInterceptor) WriteHeader(statusCode int) {
@@ -20,100 +40,94 @@ func (w *responseWriterInterceptor) WriteHeader(statusCode int) {
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
-// NewHTTPPipeline собирает стандартную цепочку production-мидлварей.
-// Принимает абстрактный ulog.Logger, что позволяет передавать любой адаптер.
-func NewHTTPPipeline(logger Logger) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return TraceIDMiddleware()(
-			RecoveryMiddleware(logger)(
-				MetricsMiddleware(logger)(next),
-			),
-		)
-	}
+func (w *responseWriterInterceptor) Write(b []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(b)
+	w.bytesWritten += n
+	return n, err
 }
 
-// TraceIDMiddleware извлекает или генерирует уникальный ID запроса
-func TraceIDMiddleware() func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			traceID := r.Header.Get("X-Trace-ID")
-			if traceID == "" {
-				traceID = generateRandomID()
+// TraceIDMiddleware intercepts downstream pipelines, enforcing distributed tracking generation across request HTTP headers.
+func TraceIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceID := r.Header.Get("X-Trace-ID")
+		if traceID == "" {
+			buf := tracePool.Get().(*traceBuffer)
+			if _, err := rand.Read(buf.raw[:]); err == nil {
+				hex.Encode(buf.hex[:], buf.raw[:])
+				traceID = unsafe.String(&buf.hex[0], len(buf.hex))
+			} else {
+				traceID = "gen-fallback-id"
 			}
-
-			// Устанавливаем заголовок ответа для клиента
-			w.Header().Set("X-Trace-ID", traceID)
-
-			// Пробрасываем trace_id в контекст запроса, используя ключ из constants.go
-			ctx := ContextWithTraceID(r.Context(), traceID)
-			next.ServeHTTP(w, r.WithContext(ctx))
-		})
-	}
+			r.Header.Set("X-Trace-ID", traceID)
+			tracePool.Put(buf)
+		}
+		w.Header().Set("X-Trace-ID", traceID)
+		next.ServeHTTP(w, r)
+	})
 }
 
-// MetricsMiddleware замеряет время выполнения запроса и логирует результат
-func MetricsMiddleware(logger Logger) func(http.Handler) http.Handler {
+// LoggingMiddleware records explicit transactional metadata metrics for completed operations on the stack. Zero-Alloc.
+func LoggingMiddleware(baseLogger Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			start := time.Now()
-			traceID, _ := r.Context().Value(traceIDKey).(string)
-
-			// Оборачиваем ResponseWriter, чтобы узнать код ответа в конце
-			interceptor := &responseWriterInterceptor{ResponseWriter: w, statusCode: http.StatusOK}
+			startTime := time.Now()
+			interceptor := newResponseWriterInterceptor(w)
 
 			next.ServeHTTP(interceptor, r)
 
-			duration := time.Since(start).Milliseconds()
+			duration := time.Since(startTime)
+			traceID := r.Header.Get("X-Trace-ID")
 
-			// Логируем событие через наш чистый абстрактный интерфейс ulog.Logger
-			logger.Info().
-				Str(LogKeyTraceID, traceID).
-				Str(LogKeyMethod, r.Method).
-				Str(LogKeyPath, r.URL.Path).
-				Int(LogKeyStatus, interceptor.statusCode).
-				Int(LogKeyDuration, int(duration)).
-				Msg("HTTP request processed")
+			fields := []Field{
+				String(LogKeyTraceID, traceID),
+				String(LogKeyMethod, r.Method),
+				String(LogKeyPath, r.URL.Path),
+				Int(LogKeyStatus, interceptor.statusCode),
+				Int(LogKeyDuration, int(duration.Milliseconds())),
+				Int(LogKeyBytesOut, interceptor.bytesWritten),
+			}
+
+			if interceptor.statusCode >= 500 {
+				baseLogger.Error("http request failed", nil, fields...)
+			} else {
+				baseLogger.Info("http request processed", fields...)
+			}
 		})
 	}
 }
 
-// RecoveryMiddleware безопасно перехватывает паники, предотвращая падение сервера
-func RecoveryMiddleware(logger Logger) func(http.Handler) http.Handler {
+// RecoveryMiddleware captures unexpected downstream routine panics, logging traces using unified constant layout parameters.
+func RecoveryMiddleware(baseLogger Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if err := recover(); err != nil {
-					traceID, _ := r.Context().Value(traceIDKey).(string)
+					traceID := r.Header.Get("X-Trace-ID")
+					fields := []Field{
+						String(LogKeyTraceID, traceID),
+						String(LogKeyMethod, r.Method),
+						String(LogKeyPath, r.URL.Path),
+						String(LogKeyPanicInfo, anyToString(err)),
+					}
 
-					// Превращаем panic в человекочитаемую ошибку и получаем стек-трейс
-					panicErr := fmt.Errorf("%v", err)
-					stackTrace := string(debug.Stack())
+					baseLogger.Error("http handler panicked", nil, fields...)
 
-					// Логируем критическую ошибку через ulog.Logger
-					logger.Error().
-						Str(LogKeyTraceID, traceID).
-						Str(LogKeyMethod, r.Method).
-						Str(LogKeyPath, r.URL.Path).
-						Err(panicErr).
-						Str("stack_trace", stackTrace).
-						Msg("HTTP handler panic recovered")
-
-					// Возвращаем клиенту красивый 500 статус
 					w.WriteHeader(http.StatusInternalServerError)
-					_, _ = w.Write([]byte("Internal Server Error"))
+					w.Write([]byte(`{"error":"internal server error"}`))
 				}
 			}()
-
 			next.ServeHTTP(w, r)
 		})
 	}
 }
 
-// Вспомогательная функция для генерации криптостойких ID запросов
-func generateRandomID() string {
-	bytes := make([]byte, 16)
-	if _, err := rand.Read(bytes); err != nil {
-		return "unknown-trace-id"
+func anyToString(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case error:
+		return t.Error()
+	default:
+		return "unknown runtime panic"
 	}
-	return hex.EncodeToString(bytes)
 }

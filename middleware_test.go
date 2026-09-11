@@ -1,169 +1,154 @@
-package ulog
+package ulog_test
 
 import (
-	"bytes"
-	"encoding/json"
-	"log/slog"
+	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
+	"sync"
 	"testing"
 
-	"github.com/rs/zerolog"
+	"github.com/ioncode/ulog/v3"
 )
 
-// Тестовая структура для валидации полей в JSON-логах мидлварей
-type middlewareLogOutput struct {
-	Level      string `json:"level"`
-	Message    string `json:"message"`
-	Msg        string `json:"msg"` // Для slog (сообщение пишется в этот ключ)
-	TraceID    string `json:"trace_id"`
-	Method     string `json:"method"`
-	Path       string `json:"path"`
-	Status     int    `json:"status"`
-	DurationMS int    `json:"duration_ms"`
-	Error      string `json:"error"`
-	StackTrace string `json:"stack_trace"`
+// mockLogger собирает залогированные поля в памяти для их последующей валидации в тестах
+type mockLogger struct {
+	mu     sync.Mutex
+	msg    string
+	err    error
+	fields []ulog.Field
 }
 
-func TestHTTPPipeline_WithZerolog(t *testing.T) {
-	var buf bytes.Buffer
+func (m *mockLogger) Info(msg string, fields ...ulog.Field) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.msg = msg
+	m.fields = fields
+}
 
-	// 1. Инициализируем адаптер Zerolog
-	baseZerolog := zerolog.New(&buf)
-	logger := NewZerologAdapter(baseZerolog)
+func (m *mockLogger) Error(msg string, err error, fields ...ulog.Field) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.msg = msg
+	m.err = err
+	m.fields = fields
+}
 
-	// 2. Создаем пайплайн и тестовый хендлер
-	pipeline := NewHTTPPipeline(logger)
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func (m *mockLogger) Debug(msg string, fields ...ulog.Field) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.msg = msg
+	m.fields = fields
+}
+
+func (m *mockLogger) With(fields ...ulog.Field) ulog.Logger {
+	return m // В нашей v2-архитектуре middleware не вызывает .With(), возвращаем сам mock
+}
+
+// findField выполняет поиск поля по ключу внутри слайса зафиксированных полей
+func findField(fields []ulog.Field, key string) (ulog.Field, bool) {
+	for _, f := range fields {
+		if f.Key == key {
+			return f, true
+		}
+	}
+	return ulog.Field{}, false
+}
+
+// 1. Тест для TraceIDMiddleware: проверяет генерацию ID и его передачу в Response заголовки
+func TestTraceIDMiddleware(t *testing.T) {
+	nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Внутренний хендлер должен увидеть прокинутый ID в запросе
+		traceID := r.Header.Get("X-Trace-ID")
+		if traceID == "" {
+			t.Error("Expected X-Trace-ID to be set in request headers")
+		}
+	})
+
+	middleware := ulog.TraceIDMiddleware(nextHandler)
+
+	req := httptest.NewRequest("GET", "/api/test", nil)
+	w := httptest.NewRecorder()
+
+	middleware.ServeHTTP(w, req)
+
+	// Ответ также должен обязательно содержать сгенерированный ID
+	if w.Header().Get("X-Trace-ID") == "" {
+		t.Error("Expected X-Trace-ID to be set in response headers")
+	}
+}
+
+// 2. Тест для LoggingMiddleware: проверяет сбор метрик на стеке в конце HTTP-вызова
+func TestLoggingMiddleware_Success(t *testing.T) {
+	mock := &mockLogger{}
+
+	nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte("created"))
 	})
 
-	// 3. Выполняем тестовый HTTP-запрос
-	req := httptest.NewRequest(http.MethodPost, "/users", nil)
-	req.Header.Set("X-Trace-ID", "custom-zerolog-id")
-	rr := httptest.NewRecorder()
+	// Собираем цепочку: TraceID (внешний) -> Logging (внутренний)
+	pipeline := ulog.TraceIDMiddleware(ulog.LoggingMiddleware(mock)(nextHandler))
 
-	pipeline(handler).ServeHTTP(rr, req)
+	req := httptest.NewRequest("POST", "/users", nil)
+	w := httptest.NewRecorder()
 
-	// 4. Проверяем HTTP-ответ
-	if rr.Code != http.StatusCreated {
-		t.Errorf("expected status 201, got %d", rr.Code)
-	}
-	if rr.Header().Get("X-Trace-ID") != "custom-zerolog-id" {
-		t.Errorf("expected trace id header, got %s", rr.Header().Get("X-Trace-ID"))
-	}
+	pipeline.ServeHTTP(w, req)
 
-	// 5. Проверяем сгенерированный JSON-лог
-	var logOut middlewareLogOutput
-	if err := json.Unmarshal(buf.Bytes(), &logOut); err != nil {
-		t.Fatalf("failed to parse json log: %v", err)
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+
+	if mock.msg != "http request processed" {
+		t.Errorf("Unexpected log message: %s", mock.msg)
 	}
 
-	if logOut.Level != "info" {
-		t.Errorf("expected level info, got %s", logOut.Level)
+	// Валидируем стандартизированные системные константы в итоговом логе
+	if f, ok := findField(mock.fields, ulog.LogKeyStatus); !ok || f.IntVal != int64(http.StatusCreated) {
+		t.Errorf("Expected status 201, got field: %+v", f)
 	}
-	if logOut.TraceID != "custom-zerolog-id" {
-		t.Errorf("expected trace_id custom-zerolog-id, got %s", logOut.TraceID)
+
+	if f, ok := findField(mock.fields, ulog.LogKeyMethod); !ok || f.StringVal != "POST" {
+		t.Errorf("Expected method POST, got field: %+v", f)
 	}
-	if logOut.Method != http.MethodPost {
-		t.Errorf("expected method POST, got %s", logOut.Method)
+
+	if f, ok := findField(mock.fields, ulog.LogKeyBytesOut); !ok || f.IntVal != 7 {
+		t.Errorf("Expected bytes_out 7, got field: %+v", f)
 	}
-	if logOut.Path != "/users" {
-		t.Errorf("expected path /users, got %s", logOut.Path)
-	}
-	if logOut.Status != http.StatusCreated {
-		t.Errorf("expected logged status 201, got %d", logOut.Status)
+
+	if _, ok := findField(mock.fields, ulog.LogKeyTraceID); !ok {
+		t.Error("Log fields are missing the mandatory standardized trace_id key")
 	}
 }
 
-func TestHTTPPipeline_WithSlog(t *testing.T) {
-	var buf bytes.Buffer
+// 3. Тест для RecoveryMiddleware: проверяет безопасный перехват паник и запись деталей сбоя
+func TestRecoveryMiddleware_HandlesPanic(t *testing.T) {
+	mock := &mockLogger{}
 
-	// 1. Инициализируем адаптер Slog
-	baseSlog := slog.New(slog.NewJSONHandler(&buf, nil))
-	logger := NewSlogAdapter(baseSlog)
-
-	// 2. Создаем пайплайн и тестовый хендлер
-	pipeline := NewHTTPPipeline(logger)
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-
-	// 3. Выполняем HTTP-запрос (без передачи X-Trace-ID, проверяем автогенерацию)
-	req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
-	rr := httptest.NewRecorder()
-
-	pipeline(handler).ServeHTTP(rr, req)
-
-	// 4. Проверяем автогенерацию TraceID
-	generatedTraceID := rr.Header().Get("X-Trace-ID")
-	if generatedTraceID == "" {
-		t.Fatal("expected automatically generated X-Trace-ID header, got empty string")
-	}
-
-	// 5. Проверяем лог
-	var logOut middlewareLogOutput
-	if err := json.Unmarshal(buf.Bytes(), &logOut); err != nil {
-		t.Fatalf("failed to parse json log: %v", err)
-	}
-
-	if strings.ToLower(logOut.Level) != "info" {
-		t.Errorf("expected level info, got %s", logOut.Level)
-	}
-	if logOut.Msg != "HTTP request processed" {
-		t.Errorf("expected message, got %s", logOut.Msg)
-	}
-	if logOut.TraceID != generatedTraceID {
-		t.Errorf("expected logged trace_id to match header %s, got %s", generatedTraceID, logOut.TraceID)
-	}
-	if logOut.Status != http.StatusOK {
-		t.Errorf("expected logged status 200, got %d", logOut.Status)
-	}
-}
-
-func TestRecoveryMiddleware(t *testing.T) {
-	var buf bytes.Buffer
-	baseZerolog := zerolog.New(&buf)
-	logger := NewZerologAdapter(baseZerolog)
-
-	// Создаем пайплайн с хендлером, который гарантированно падает в панику
-	pipeline := NewHTTPPipeline(logger)
 	panicHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		panic("something went completely wrong")
+		panic(errors.New("db connection timeout"))
 	})
 
-	req := httptest.NewRequest(http.MethodDelete, "/delete-everything", nil)
-	rr := httptest.NewRecorder()
+	// Цепочка: TraceID -> Recovery -> Паникующий хендлер
+	pipeline := ulog.TraceIDMiddleware(ulog.RecoveryMiddleware(mock)(panicHandler))
 
-	// Запускаем — мидлварь должна поймать панику и не дать тесту упасть
-	pipeline(panicHandler).ServeHTTP(rr, req)
+	req := httptest.NewRequest("GET", "/panic-route", nil)
+	w := httptest.NewRecorder()
 
-	// Проверяем, что клиенту ушел красивый статус 500
-	if rr.Code != http.StatusInternalServerError {
-		t.Errorf("expected status 500 on panic, got %d", rr.Code)
-	}
-	if !strings.Contains(rr.Body.String(), "Internal Server Error") {
-		t.Errorf("expected emergency body message, got %s", rr.Body.String())
-	}
+	pipeline.ServeHTTP(w, req)
 
-	// Проверяем запись об ошибке в логе
-	var logOut middlewareLogOutput
-	if err := json.Unmarshal(buf.Bytes(), &logOut); err != nil {
-		t.Fatalf("failed to parse panic json log: %v", err)
+	// Сервер не должен упасть. Он обязан вернуть корректный 500 ошибку клиенту.
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("Expected status 500, got %d", w.Code)
 	}
 
-	if logOut.Level != "error" {
-		t.Errorf("expected level error for panic, got %s", logOut.Level)
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+
+	if mock.msg != "http handler panicked" {
+		t.Errorf("Unexpected panic log message: %s", mock.msg)
 	}
-	if logOut.Message != "HTTP handler panic recovered" {
-		t.Errorf("expected precise panic message, got %s", logOut.Message)
-	}
-	if !strings.Contains(logOut.Error, "something went completely wrong") {
-		t.Errorf("expected root panic reason in logs, got %s", logOut.Error)
-	}
-	if logOut.StackTrace == "" {
-		t.Error("expected stack_trace field to be present, got empty string")
+
+	// Проверяем наличие информации о панике по системной константе
+	if f, ok := findField(mock.fields, ulog.LogKeyPanicInfo); !ok || f.StringVal != "db connection timeout" {
+		t.Errorf("Expected valid panic details, got field: %+v", f)
 	}
 }
