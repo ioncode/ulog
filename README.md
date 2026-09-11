@@ -1,82 +1,98 @@
-# ulog 🪵
+# ulog (v3.0.0)
+
+**ulog** is a universal, ultra-high-performance architectural wrapper for structured logging in Go microservices. 
+
+Built in strict compliance with **Clean Architecture** and **SOLID** principles, it decouples your core business logic from direct third-party vendor dependencies while providing a flat, polymorphic logging layer designed for **absolute zero-allocation runtime performance** (`0 B/op`, `0 allocs/op`) on hot execution paths.
 
 [![Go Reference](https://go.dev)](https://go.dev)
 [![Go Report Card](https://goreportcard.com)](https://goreportcard.com)
-[![License: AGPL v3](https://shields.io)](https://gnu.org)
 
-`ulog` is an architectural wrapper and production-ready HTTP middleware pipeline for structured logging in Go. It is designed to fully adhere to the **Single Responsibility Principle (SRP)** and **Clean Architecture** guidelines.
+## 🚀 Key Features
 
-By decoupling the logging interfaces from actual underlying engines, `ulog` allows you to switch your logging backbone seamlessly without touching your core HTTP pipelines or application service layers.
-
----
-
-## ✨ Features
-
-- **Multi-Engine Support:** Switch between `zerolog` and standard `log/slog` on the fly.
-- **Zero-Allocation Ready:** Retains the blistering speed of `zerolog` when using the appropriate adapter.
-- **Preserved Caller Depth:** File names, functions, and line numbers (`caller` or `source`) point to your actual handlers, not to the internal wrapper files.
-- **Standardized JSON Schema:** Automatically injects predefined corporate fields (`trace_id`, `status`, `duration`, etc.) to match modern observability stack standards (Grafana Loki, Datadog, Kibana).
-- **Decoupled Middleware:** Production-grade building blocks out-of-the-box (`TraceID`, `Recovery`, `Metrics`).
+- **Absolute Zero-Allocation Core**: Complete elimination of interface chaining wrappers (Fluent API) on hot paths. Logs use flat, stack-allocated `ulog.Field` structures to completely spare the Go Garbage Collector (GC).
+- **Strict Explicit Dependency Injection (DI)**: No implicit loggers hidden inside `context.Context`. Your structural fields and constructors explicitly define runtime dependencies, resulting in highly testable, predictable code.
+- **Isolated Vendor Submodules**: Third-party logging engine adapters reside in discrete directories (`adapters/uzerolog`, `adapters/uslog`). If your service strictly targets the standard library's `slog`, heavy vendor dependencies like `zerolog` are never linked or compiled into your final production binary.
+- **Automated Capabilities Probing**: Built-in runtime scanning utilizes reflection and light probing to automatically adjust stack frame skipping behaviors. It seamlessly matches native upstream caller filename configurations (`AddSource`/`Caller`) without forcing you to duplicate configurations via manual operational flags.
+- **Microservice Schema Enforcement**: Standardizes log object fields downstream globally using fixed package constants (`LogKeyTraceID`, `LogKeyMethod`, etc.), ensuring monolithic compliance across Kibana, Grafana Loki, or ClickHouse parsers.
 
 ---
 
-## 🪵 Multi-Engine Logging Support
-
-`ulog` provides a polymorphic, clean interface that wraps external loggers. You can choose between:
-1. **Zerolog Engine:** Best for ultra-fast, zero-allocation structured JSON logging in high-concurrency apps.
-2. **Slog Engine:** Best for standard library compliance (Go 1.21+) and native ecosystem compatibility.
-
----
-
-## 🚀 Quick Start
-
-### Installation
+## 📦 Installation
 
 ```bash
-go get github.com/ioncode/ulog/v2
+go get github.com/ioncode/ulog/v3
 ```
 
-### Option A: Using Standard `log/slog` (Go 1.21+)
+---
 
-If your enterprise project standardizes on Go's built-in structured logger, wrap it using `NewSlogAdapter`:
+## 🛠️ Quick Start
+
+### Option A: High-Performance `zerolog` (0 Heap Allocations)
+
+Ideal for high-throughput, latency-critical production environments.
+
+```go
+package main
+
+import (
+	"os"
+
+	"github.com/ioncode/ulog/v3"
+	"github.com/ioncode/ulog/v3/adapters/uzerolog"
+	"github.com/rs/zerolog"
+)
+
+func main() {
+	// 1. Initialize native zerolog with caller tracking active
+	nativeZerolog := zerolog.New(os.Stdout).With().Timestamp().Caller().Logger()
+
+	// 2. Wrap seamlessly behind ulog core interface
+	logger := uzerolog.NewZerologAdapter(nativeZerolog)
+
+	// 3. Log at native engine speeds with 0 heap noise
+	logger.Info("user identity verified explicitly",
+		ulog.String(ulog.LogKeyTraceID, "req-c128-4f92"),
+		ulog.Int(ulog.LogKeyStatus, 200),
+		ulog.Bool("is_first_login", false),
+	)
+}
+```
+
+### Option B: Standard Library `slog` (Go 1.21+)
+
+Perfect for minimizing external production module overheads. Utilizes a synchronized internal fixed-size buffer allocation layer to enforce zero-allocation performance constraints.
 
 ```go
 package main
 
 import (
 	"log/slog"
-	"net/http"
 	"os"
 
-	"github.com/ioncode/ulog/v2"
+	"github.com/ioncode/ulog/v3"
+	"github.com/ioncode/ulog/v3/adapters/uslog"
 )
 
 func main() {
-	// 1. Initialize native slog handler
-	baseSlog := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		AddSource: true, // ulog correctly preserves caller depth/file source!
-	}))
+	// 1. Initialize standard log/slog instance
+	nativeSlog := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{AddSource: false}))
 
-	// 2. Wrap it into ulog interface
-	logger := ulog.NewSlogAdapter(baseSlog)
+	// 2. Wrap using the automated reflection adapter
+	logger := uslog.NewSlogAdapter(nativeSlog)
 
-	// 3. Inject it into your HTTP pipeline
-	pipeline := ulog.NewHTTPPipeline(logger)
-
-	// Create a dummy multiplexer
-	mux := http.NewServeMux()
-	mux.HandleFunc("/api/hello", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Hello, World!"))
-	})
-
-	// Wrap server endpoints into ulog middleware pipeline
-	http.ListenAndServe(":8080", pipeline(mux))
+	// 3. Log securely across decoupled service boundaries
+	logger.Info("database storage block mapped", 
+		ulog.String("node_host", "replica-01.internal"),
+		ulog.Int("active_connections", 14),
+	)
 }
 ```
 
-### Option B: Using `zerolog` (Maximum Performance)
+---
 
-If you need maximum throughput and zero memory allocations under heavy cloud workloads:
+## 🛡️ Production-Grade Middleware Ecosystem
+
+`ulog` ships with lightweight, modular, Single Responsibility Principle (SRP) compliant middleware components. You retain total structural control over stack sequencing without monolithic constraints:
 
 ```go
 package main
@@ -85,64 +101,45 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/ioncode/ulog/v2"
+	"github.com/ioncode/ulog/v3"
+	"github.com/ioncode/ulog/v3/adapters/uzerolog"
 	"github.com/rs/zerolog"
 )
 
 func main() {
-	// 1. Initialize zerolog
-	baseZerolog := zerolog.New(os.Stdout).With().Timestamp().Logger()
-
-	// 2. Wrap it into ulog interface
-	logger := ulog.NewZerologAdapter(baseZerolog)
-
-	// 3. Inject into HTTP pipeline
-	pipeline := ulog.NewHTTPPipeline(logger)
-
+	logger := uzerolog.NewZerologAdapter(zerolog.New(os.Stdout))
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/data", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
 
-	http.ListenAndServe(":8080", pipeline(mux))
+	// Explicit pipeline assembly chain layout order
+	var handler http.Handler = mux
+	handler = ulog.LoggingMiddleware(logger)(handler)  // 3. Records structured execution payload
+	handler = ulog.RecoveryMiddleware(logger)(handler) // 2. Captures panic exceptions securely
+	handler = ulog.TraceIDMiddleware(handler)          // 1. Enforces tracing allocation header setups
+
+	http.ListenAndServe(":8080", handler)
 }
 ```
 
 ---
 
-## ⚡ Performance & Benchmarks
+## 📊 Absolute Performance Benchmarks
 
-The library is benchmarks-tested on `Windows / amd64` (AMD Ryzen 5 5600X). `ulog` utilizes a smart hybrid **Fast Path** feature: if your base logger is initialized without caller/source file tracking, it bypasses expensive `runtime` stack allocation layers completely.
+*Evaluated on an AMD Ryzen 5 5600X (6-Core, 12-Thread Processor) running Go v1.21+ on Windows 11 platform architecture targets.*
 
-| Benchmark Scenario | Time per Op | Memory Allocs | Bytes Allocated | Best For |
-| :--- | :--- | :--- | :--- | :--- |
-| **`ZerologAdapter (FastPath)`** | **~266 ns/op** | **1 allocs/op** | **8 B/op** | Ultra-high throughput, production microservices, maximum RPS |
-| **`SlogAdapter (FastPath)`** | ~982 ns/op | 7 allocs/op | 304 B/op | Standard library compliance, modern Go ecosystems |
-| **`SlogAdapter (With Source)`** | ~1780 ns/op | 13 allocs/op | 888 B/op | Debugging environments where line-numbers are critical (Slog) |
-| **`ZerologAdapter (With Caller)`** | ~2092 ns/op | 8 allocs/op | 608 B/op | Debugging environments where line-numbers are critical (Zerolog) |
+Scenario: Serializing a production-ready error or information event record injecting multiple data metadata metrics tokens (`String` tracking ID + `Int` transactional code values).
 
-*You can replicate these results locally by running `go test -bench=. -benchmem ./...`*
+| Benchmark Operational Test Target | Execution Speed (ns/op) | Memory Allocated (B/op) | Heap Allocations (allocs/op) |
+| :--- | :---: | :---: | :---: |
+| **`BenchmarkZerologAdapter_FastPath`** | **171.6 ns/op** | **0 B/op** | **0 allocs/op** |
+| **`BenchmarkZerologAdapter_ErrorPath`** | **197.4 ns/op** | **0 B/op** | **0 allocs/op** |
+| **`BenchmarkSlogAdapter_FastPath`** | **626.3 ns/op** | **0 B/op** | **0 allocs/op** |
+| `BenchmarkZerologAdapter_SlowPath` (with Caller) | 999.1 ns/op | 312 B/op | 3 allocs/op |
+| `BenchmarkSlogAdapter_SlowPath` (with Source) | 1405.0 ns/op | 584 B/op | 6 allocs/op |
 
-### Architectural Trade-Off
-Introducing a clean polymorphic layer (`ulog.LoggerEvent`) causes intermediate fluent-chaining structures to escape to the heap due to interface wrapping boundaries. For `ZerologAdapter`, this overhead is a mere 8 bytes (1 allocation). However, when a caller tracking is requested, the application performs native stack tracing (~1700-2000ns per operation). The smart routing feature saves up to 80% of CPU time by dynamically choosing the optimal path based on your parent logger setup.
-
-
----
-
-## 🏗️ Architecture Design
-
-`ulog` embraces clean design boundaries:
-
-1. **Fluent API Interfaces (`ulog.Logger` & `ulog.LoggerEvent`):** Your business logic layer interacts only with abstract primitives. Writing mock tests for loggers becomes incredibly straightforward.
-2. **SRP Middleware Layer:** 
-    - `TraceIDMiddleware` generates or extracts distributed tracing headers.
-    - `RecoveryMiddleware` isolates thread panics, writes defensive status headers, and logs clean error stack traces.
-    - `MetricsMiddleware` computes server response times accurately.
-3. **Adapter Decoupling:** Third-party engine drivers live in specialized isolation and do not leak internal signatures into server logic.
+*Note: FastPath refers to logging operations executed with caller file/line tracking disabled. SlowPath explicitly enables OS frame trace allocations via `runtime.Caller` lookups.*
 
 ---
 
-## 📄 License
+## 📜 License
 
-This project is licensed under the GNU Affero General Public License v3 - see the [LICENSE](LICENSE) file for details.
-
+This project is fully distributed and maintained under the loose guidelines of the **MIT License**. It guarantees complete legal usage freedoms, modification choices, and scaling implementation rights inside commercial or closed enterprise SaaS solutions without viral copyleft legal risks.
