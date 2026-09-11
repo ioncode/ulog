@@ -20,11 +20,11 @@ jobs:
     steps:
       # 1. Скачиваем исходный код репозитория на виртуальную машину
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # 2. Устанавливаем необходимую версию Go из матрицы
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go-version }}
           cache: true # Включает автоматическое кэширование go.mod зависимостей
